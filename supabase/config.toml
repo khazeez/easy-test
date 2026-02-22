@@ -1,0 +1,19 @@
+project_id = "sohumzqghdoizzcjgoee"
+
+[functions.run-newman]
+verify_jwt = false
+
+[functions.trigger-newman-github]
+verify_jwt = false
+
+[functions.newman-github-callback]
+verify_jwt = false
+
+[functions.get-shared-report]
+verify_jwt = false
+
+[functions.trigger-k6-github]
+verify_jwt = false
+
+[functions.k6-github-callback]
+verify_jwt = false

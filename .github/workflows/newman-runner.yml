@@ -1,0 +1,314 @@
+name: Newman Test Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Newman test run ID'
+        required: true
+      supabase_url:
+        description: 'Supabase URL'
+        required: true
+      supabase_service_key:
+        description: 'Supabase service role key'
+        required: true
+      skip_ssl:
+        description: 'Skip SSL verification'
+        required: false
+        default: 'true'
+      folder_name:
+        description: 'Folder name to run (optional)'
+        required: false
+        default: ''
+
+jobs:
+  run-newman:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Newman
+        run: npm install -g newman
+
+      - name: Fetch collection and environment from Supabase
+        run: |
+          # Fetch run data to get collection_id and environment_id
+          RUN_DATA=$(curl -s \
+            "${{ inputs.supabase_url }}/rest/v1/newman_test_runs?id=eq.${{ inputs.run_id }}&select=*" \
+            -H "apikey: ${{ inputs.supabase_service_key }}" \
+            -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
+          
+          COLLECTION_ID=$(echo "$RUN_DATA" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');const r=JSON.parse(d)[0];console.log(r.collection_id)")
+          ENVIRONMENT_ID=$(echo "$RUN_DATA" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');const r=JSON.parse(d)[0];console.log(r.environment_id||'')")
+          
+          echo "COLLECTION_ID=$COLLECTION_ID" >> $GITHUB_ENV
+          echo "ENVIRONMENT_ID=$ENVIRONMENT_ID" >> $GITHUB_ENV
+          
+          # Fetch collection data
+          COLLECTION=$(curl -s \
+            "${{ inputs.supabase_url }}/rest/v1/newman_collections?id=eq.$COLLECTION_ID&select=collection_data" \
+            -H "apikey: ${{ inputs.supabase_service_key }}" \
+            -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
+          
+          echo "$COLLECTION" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');const r=JSON.parse(d)[0];require('fs').writeFileSync('collection.json',JSON.stringify(r.collection_data))"
+          
+          # Fetch environment data if set
+          if [ -n "$ENVIRONMENT_ID" ] && [ "$ENVIRONMENT_ID" != "null" ] && [ "$ENVIRONMENT_ID" != "" ]; then
+            ENV_DATA=$(curl -s \
+              "${{ inputs.supabase_url }}/rest/v1/newman_environments?id=eq.$ENVIRONMENT_ID&select=*" \
+              -H "apikey: ${{ inputs.supabase_service_key }}" \
+              -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
+            
+            echo "$ENV_DATA" | node -e "
+              const d=require('fs').readFileSync('/dev/stdin','utf8');
+              const r=JSON.parse(d)[0];
+              const env={name:r.name,values:(r.values||[]).map(v=>({key:v.key,value:v.value,enabled:true}))};
+              require('fs').writeFileSync('environment.json',JSON.stringify(env));
+            "
+          fi
+
+      - name: Download test files
+        run: |
+          # Fetch collection files from newman_collection_files table
+          COLLECTION_FILES=$(curl -s \
+            "${{ inputs.supabase_url }}/rest/v1/newman_collection_files?collection_id=eq.$COLLECTION_ID&select=file_path,storage_path" \
+            -H "apikey: ${{ inputs.supabase_service_key }}" \
+            -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
+          
+          echo "Collection files: $COLLECTION_FILES"
+          
+          # Download each file from storage
+          echo "$COLLECTION_FILES" | node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const data = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+            if (!Array.isArray(data) || data.length === 0) {
+              console.log('No test files to download');
+              process.exit(0);
+            }
+            const promises = data.map(async (f) => {
+              const dir = path.dirname(f.file_path);
+              if (dir && dir !== '.') {
+                fs.mkdirSync(dir, { recursive: true });
+              }
+              const url = '${{ inputs.supabase_url }}/storage/v1/object/newman-files/' + encodeURIComponent(f.storage_path).replace(/%2F/g, '/');
+              console.log('Downloading:', f.file_path, 'from', url);
+              const resp = await fetch(url, {
+                headers: {
+                  'apikey': '${{ inputs.supabase_service_key }}',
+                  'Authorization': 'Bearer ${{ inputs.supabase_service_key }}'
+                }
+              });
+              if (!resp.ok) {
+                console.error('Failed to download', f.file_path, resp.status, await resp.text());
+                return;
+              }
+              const buffer = Buffer.from(await resp.arrayBuffer());
+              fs.writeFileSync(f.file_path, buffer);
+              console.log('Downloaded:', f.file_path, '(' + buffer.length + ' bytes)');
+            });
+            Promise.all(promises).then(() => console.log('All files downloaded'));
+          "
+
+      - name: Run Newman
+        id: newman
+        run: |
+          ARGS="collection.json --reporters cli,json --reporter-json-export results.json"
+          if [ -f environment.json ]; then
+            ARGS="$ARGS -e environment.json"
+          fi
+          if [ "${{ inputs.skip_ssl }}" = "true" ]; then
+            ARGS="$ARGS --insecure"
+          fi
+          if [ -n "${{ inputs.folder_name }}" ]; then
+            ARGS="$ARGS --folder ${{ inputs.folder_name }}"
+          fi
+          echo "Running: newman run $ARGS"
+          newman run $ARGS 2>&1 | tee newman-cli-output.txt || true
+
+      - name: Send results back
+        if: always()
+        run: |
+          # Parse results for summary
+          node -e "
+          const fs = require('fs');
+
+          let results = {};
+          let hasResults = false;
+          try {
+            results = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+            hasResults = true;
+          } catch(e) {
+            console.log('No results.json found, Newman likely crashed');
+          }
+
+          // Read CLI output
+          let cliOutput = '';
+          try {
+            cliOutput = fs.readFileSync('newman-cli-output.txt', 'utf8');
+          } catch(e) {}
+
+          if (!hasResults) {
+            // Newman crashed - send error payload with CLI output
+            const payload = {
+              run_id: '${{ inputs.run_id }}',
+              status: 'failed',
+              result_data: {
+                summary: { total_requests: 0, passed: 0, failed: 0 },
+                assertions: { total: 0, passed: 0, failed: 0 },
+                requests: [],
+                assertionDetails: [],
+                errors: [{ requestName: 'Newman Runner', message: 'Newman crashed before producing results. Check CLI output for details.', statusCode: null }],
+                raw_stats: {},
+                timings: {},
+                cli_output: cliOutput || 'No output captured'
+              }
+            };
+            fs.writeFileSync('payload.json', JSON.stringify(payload));
+            console.log('Newman crashed, sending error payload');
+          } else {
+            const run = results.run || {};
+            const stats = run.stats || {};
+            const timings = run.timings || {};
+
+            const requests = (run.executions || []).map((exec, idx) => {
+              const req = exec.request || {};
+              const resp = exec.response || {};
+              const assertions = (exec.assertions || []).map(a => ({
+                name: a.assertion,
+                passed: !a.error,
+                error: a.error ? a.error.message : null
+              }));
+              
+              const reqHeaders = {};
+              if (req.header && Array.isArray(req.header)) {
+                req.header.forEach(h => { reqHeaders[h.key] = h.value; });
+              }
+              
+              const respHeaders = {};
+              if (resp.header && Array.isArray(resp.header)) {
+                resp.header.forEach(h => { respHeaders[h.key] = h.value; });
+              }
+              
+              let reqBody = null;
+              if (req.body) {
+                if (req.body.mode === 'raw') reqBody = req.body.raw;
+                else if (req.body.mode === 'formdata') reqBody = req.body.formdata;
+                else if (req.body.mode === 'urlencoded') reqBody = req.body.urlencoded;
+                else reqBody = req.body;
+              }
+              
+              let respBody = null;
+              try {
+                const stream = resp.stream;
+                if (stream && Buffer.isBuffer(stream)) {
+                  respBody = stream.toString('utf8').slice(0, 10240);
+                } else if (resp.body) {
+                  respBody = typeof resp.body === 'string' ? resp.body.slice(0, 10240) : JSON.stringify(resp.body).slice(0, 10240);
+                }
+              } catch(e) {}
+              
+              const preRequestScripts = [];
+              const testScripts = [];
+              if (exec.item && exec.item.event) {
+                exec.item.event.forEach(ev => {
+                  if (ev.listen === 'prerequest' && ev.script) {
+                    preRequestScripts.push((ev.script.exec || []).join('\\n'));
+                  }
+                  if (ev.listen === 'test' && ev.script) {
+                    testScripts.push((ev.script.exec || []).join('\\n'));
+                  }
+                });
+              }
+              
+              return {
+                index: idx,
+                name: exec.item?.name || 'Unknown',
+                method: req.method || 'GET',
+                url: req.url?.toString() || '',
+                statusCode: resp.code || 0,
+                statusMessage: resp.status || '',
+                responseTime: resp.responseTime || 0,
+                responseSize: resp.responseSize || 0,
+                assertions,
+                requestHeaders: reqHeaders,
+                responseHeaders: respHeaders,
+                requestBody: reqBody,
+                responseBody: respBody,
+                preRequestScripts,
+                testScripts,
+                cookies: resp.cookie || []
+              };
+            });
+
+            const assertionDetails = [];
+            (run.executions || []).forEach(exec => {
+              (exec.assertions || []).forEach(a => {
+                assertionDetails.push({
+                  name: a.assertion,
+                  passed: !a.error,
+                  requestName: exec.item?.name || 'Unknown',
+                  error: a.error ? a.error.message : null
+                });
+              });
+            });
+
+            const errors = [];
+            (run.executions || []).forEach(exec => {
+              if (exec.requestError) {
+                errors.push({
+                  requestName: exec.item?.name || 'Unknown',
+                  message: exec.requestError.message || String(exec.requestError),
+                  statusCode: null
+                });
+              }
+              (exec.assertions || []).forEach(a => {
+                if (a.error) {
+                  errors.push({
+                    requestName: exec.item?.name || 'Unknown',
+                    message: a.error.message,
+                    statusCode: null
+                  });
+                }
+              });
+            });
+
+            const summary = {
+              total_requests: stats.requests?.total || 0,
+              passed: stats.assertions?.total - (stats.assertions?.failed || 0) || 0,
+              failed: stats.assertions?.failed || 0
+            };
+
+            const payload = {
+              run_id: '${{ inputs.run_id }}',
+              status: (stats.assertions?.failed || 0) > 0 ? 'failed' : 'passed',
+              result_data: {
+                summary,
+                assertions: {
+                  total: stats.assertions?.total || 0,
+                  passed: (stats.assertions?.total || 0) - (stats.assertions?.failed || 0),
+                  failed: stats.assertions?.failed || 0
+                },
+                requests,
+                assertionDetails,
+                errors,
+                raw_stats: stats,
+                timings,
+                cli_output: cliOutput
+              }
+            };
+
+            fs.writeFileSync('payload.json', JSON.stringify(payload));
+            console.log('Summary:', JSON.stringify(summary));
+          }
+          "
+
+          # Call the callback edge function
+          curl -X POST \
+            "${{ inputs.supabase_url }}/functions/v1/newman-github-callback" \
+            -H "Content-Type: application/json" \
+            -H "apikey: ${{ inputs.supabase_service_key }}" \
+            -d @payload.json
