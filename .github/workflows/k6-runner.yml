@@ -1,4 +1,3 @@
-# k6 Load Test Runner - triggered via workflow_dispatch
 name: k6 Load Test Runner
 
 on:
@@ -33,90 +32,62 @@ jobs:
 
       - name: Fetch test config and environment from Supabase
         run: |
-          # Fetch run data
           RUN_DATA=$(curl -s \
             "${{ inputs.supabase_url }}/rest/v1/k6_test_runs?id=eq.${{ inputs.run_id }}&select=*" \
             -H "apikey: ${{ inputs.supabase_service_key }}" \
             -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
-
+          
           echo "Run data fetched"
-
-          # Extract config_id and environment_id
-          node -e "
-            const fs = require('fs');
-            const data = JSON.parse('$( echo "$RUN_DATA" | sed "s/'/\\\\'/g" )');
-            const run = Array.isArray(data) ? data[0] : data;
-            if (!run) { console.error('Run not found'); process.exit(1); }
-            fs.writeFileSync('run_info.json', JSON.stringify(run));
-            console.log('test_config_id=' + (run.test_config_id || ''));
-            console.log('environment_id=' + (run.environment_id || ''));
-          " > run_vars.txt
-
-          CONFIG_ID=$(node -e "const r=JSON.parse(require('fs').readFileSync('run_info.json','utf8'));console.log(r.test_config_id||'')")
-          ENV_ID=$(node -e "const r=JSON.parse(require('fs').readFileSync('run_info.json','utf8'));console.log(r.environment_id||'')")
-
+          
+          CONFIG_ID=$(echo "$RUN_DATA" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');const r=JSON.parse(d)[0];console.log(r.test_config_id||'')")
+          ENV_ID=$(echo "$RUN_DATA" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');const r=JSON.parse(d)[0];console.log(r.environment_id||'')")
+          
           echo "CONFIG_ID=$CONFIG_ID" >> $GITHUB_ENV
           echo "ENV_ID=$ENV_ID" >> $GITHUB_ENV
-
-          # Fetch test config
-          if [ -n "$CONFIG_ID" ] && [ "$CONFIG_ID" != "null" ]; then
+          
+          if [ -n "$CONFIG_ID" ] && [ "$CONFIG_ID" != "null" ] && [ "$CONFIG_ID" != "" ]; then
             CONFIG_DATA=$(curl -s \
               "${{ inputs.supabase_url }}/rest/v1/k6_test_configs?id=eq.$CONFIG_ID&select=*" \
               -H "apikey: ${{ inputs.supabase_service_key }}" \
               -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
-
-            node -e "
+            
+            echo "$CONFIG_DATA" | node -e "
               const fs = require('fs');
               const data = JSON.parse(fs.readFileSync('/dev/stdin','utf8'));
               const cfg = Array.isArray(data) ? data[0] : data;
               if (!cfg) { console.error('Config not found'); process.exit(1); }
               fs.writeFileSync('config.json', JSON.stringify(cfg));
-
-              // Write the k6 script
+              
               if (cfg.script) {
                 fs.writeFileSync('test.js', cfg.script);
                 console.log('Script written to test.js');
               } else {
-                // Generate a minimal script
-                const script = \`
-import http from 'k6/http';
-import { check, sleep } from 'k6';
-
-export const options = {
-  vus: \${cfg.vus || 10},
-  duration: '\${cfg.duration || '30s'}',
-};
-
-export default function () {
-  const res = http.get(__ENV.BASE_URL || 'http://localhost:3000');
-  check(res, { 'status is 200': (r) => r.status === 200 });
-  sleep(1);
-}
-\`;
+                const vus = cfg.vus || 10;
+                const duration = cfg.duration || '30s';
+                const script = 'import http from \"k6/http\";\\nimport { check, sleep } from \"k6\";\\n\\nexport const options = { vus: ' + vus + ', duration: \"' + duration + '\" };\\n\\nexport default function () {\\n  const res = http.get(__ENV.BASE_URL || \"http://localhost:3000\");\\n  check(res, { \"status is 200\": (r) => r.status === 200 });\\n  sleep(1);\\n}\\n';
                 fs.writeFileSync('test.js', script);
                 console.log('Default script generated');
               }
-            " <<< "$CONFIG_DATA"
+            "
           fi
-
-          # Fetch environment variables
+          
           if [ -n "$ENV_ID" ] && [ "$ENV_ID" != "null" ] && [ "$ENV_ID" != "" ]; then
             ENV_DATA=$(curl -s \
               "${{ inputs.supabase_url }}/rest/v1/k6_environments?id=eq.$ENV_ID&select=*" \
               -H "apikey: ${{ inputs.supabase_service_key }}" \
               -H "Authorization: Bearer ${{ inputs.supabase_service_key }}")
-
-            node -e "
+            
+            echo "$ENV_DATA" | node -e "
               const fs = require('fs');
               const data = JSON.parse(fs.readFileSync('/dev/stdin','utf8'));
               const env = Array.isArray(data) ? data[0] : data;
               if (env && env.values) {
                 const vars = Array.isArray(env.values) ? env.values : [];
-                const envStr = vars.map(v => v.key + '=' + v.value).join('\n');
+                const envStr = vars.map(v => v.key + '=' + v.value).join('\\n');
                 fs.writeFileSync('k6_env.txt', envStr);
                 console.log('Environment variables written:', vars.length);
               }
-            " <<< "$ENV_DATA"
+            "
           fi
 
       - name: Update run status to running
@@ -134,7 +105,6 @@ export default function () {
         run: |
           K6_ARGS="run test.js --out json=results.json --summary-export=summary.json"
 
-          # Add environment variables from file
           if [ -f k6_env.txt ]; then
             while IFS= read -r line; do
               if [ -n "$line" ]; then
@@ -147,6 +117,7 @@ export default function () {
           k6 $K6_ARGS 2>&1 | tee k6-output.txt || true
 
       - name: Parse and send results
+        if: always()
         run: |
           node -e "
           const fs = require('fs');
@@ -161,14 +132,13 @@ export default function () {
           const vus = metrics.vus || {};
           const iterations = metrics.iterations || {};
 
-          // Parse JSON output for timeline data
           const timeline = [];
           const endpointMap = {};
 
           try {
-            const lines = fs.readFileSync('results.json', 'utf8').split('\n').filter(l => l.trim());
+            const lines = fs.readFileSync('results.json', 'utf8').split('\\n').filter(l => l.trim());
             let startTime = null;
-            const bucketSize = 1000; // 1 second buckets
+            const bucketSize = 1000;
             const buckets = {};
 
             for (const line of lines) {
@@ -182,7 +152,6 @@ export default function () {
                   buckets[bucket].times.push(entry.data.value);
                   buckets[bucket].total++;
 
-                  // Track per-endpoint
                   const url = entry.data.tags?.url || 'unknown';
                   const method = entry.data.tags?.method || 'GET';
                   const name = entry.data.tags?.name || url;
@@ -208,7 +177,6 @@ export default function () {
               } catch(e) {}
             }
 
-            // Build timeline
             const sortedBuckets = Object.keys(buckets).map(Number).sort((a, b) => a - b);
             for (const b of sortedBuckets) {
               const d = buckets[b];
@@ -227,7 +195,6 @@ export default function () {
             }
           } catch(e) { console.error('Error parsing results.json:', e.message); }
 
-          // Build endpoints array
           const endpoints = Object.values(endpointMap).map(ep => {
             const sorted = ep.times.sort((a, b) => a - b);
             const len = sorted.length;
@@ -243,9 +210,7 @@ export default function () {
             };
           });
 
-          // Build checks from summary
           const checksData = [];
-          const checksMetric = metrics.checks || {};
           if (summary.root_group) {
             function extractChecks(group) {
               (group.checks || []).forEach(c => {
@@ -261,7 +226,6 @@ export default function () {
             extractChecks(summary.root_group);
           }
 
-          // Build thresholds
           const thresholdsData = [];
           if (summary.thresholds) {
             for (const [metric, result] of Object.entries(summary.thresholds)) {
@@ -276,12 +240,10 @@ export default function () {
             }
           }
 
-          // Read CLI output for errors
           let cliOutput = '';
           try { cliOutput = fs.readFileSync('k6-output.txt', 'utf8'); } catch(e) {}
 
           const errors = [];
-          // Check for HTTP errors in endpoints
           endpoints.forEach(ep => {
             if (ep.errorRate > 0) {
               errors.push({
@@ -335,7 +297,6 @@ export default function () {
           console.log('Avg response:', avgResp.toFixed(0) + 'ms');
           "
 
-          # Send results back via callback
           curl -X POST \
             "${{ inputs.supabase_url }}/functions/v1/k6-github-callback" \
             -H "Content-Type: application/json" \
